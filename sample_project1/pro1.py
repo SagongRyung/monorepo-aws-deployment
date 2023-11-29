@@ -1,0 +1,1 @@
+print("sample_project1のファイルです")

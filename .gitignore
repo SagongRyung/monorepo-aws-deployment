@@ -1,0 +1,5 @@
+*.sh
+*.json
+*.env
+*__pycache__*
+!.github/json/*

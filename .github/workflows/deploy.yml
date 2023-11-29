@@ -1,0 +1,152 @@
+name: Build and Push Docker Image to AWS ECR
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [closed]
+
+jobs:
+  check_commit_message:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    outputs:
+      PROJECT_NAME: ${{ steps.extracting.outputs.PROJECT_NAME }}
+
+    steps:
+    - name: Extracting project names from commit messages
+      id: extracting
+      run: |
+        project_name=$(echo "${{ github.event.pull_request.title}}" | sed -n 's/.*<\(.*\)>.*/\1/p')
+        echo "specified project name is -> $project_name"
+        if [ -z "$project_name" ]; then
+            echo "Skip jobs after this one because the project name is empty."
+        fi
+        echo "PROJECT_NAME=${project_name}" >> $GITHUB_OUTPUT
+
+
+  build-and-push:
+    if: ${{ needs.check_commit_message.outputs.PROJECT_NAME  != ''}}
+    needs: check_commit_message
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v2
+    
+    - name: Check target folder name
+      id: check-folder-name
+      run: |
+        folder_name_list=$(ls -d */ | sed 's/\///g')
+        echo $folder_name_list
+        folder_name=${{ needs.check_commit_message.outputs.PROJECT_NAME }}
+        if echo "$folder_name_list" | grep -q -x "$folder_name"; then
+            echo " $folder_name -> It exists, so Continue to next steps."
+        else
+            echo " $folder_name -> Not exist, project name is may be incorrect."
+            exit 1
+        fi
+
+    
+    - name: Set up Docker
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build Docker image
+      run: |
+        docker build -t ${{ needs.check_commit_message.outputs.PROJECT_NAME }}:latest ./${{ needs.check_commit_message.outputs.PROJECT_NAME }}
+      working-directory: .
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    
+    - name: Set Exist Flg to Env
+      id: set-exist-flg
+      run: |
+        echo "LAMBDA_FUNCTION_FLG=false" >> $GITHUB_ENV
+
+        
+    - name: Get List to AWS Lambda 
+      run: |
+        FUNCTION_NAME=${{ needs.check_commit_message.outputs.PROJECT_NAME }}
+        FUNCTION_LIST=$(aws lambda list-functions --output text 2>&1)
+        if echo "$FUNCTION_LIST" | grep -q "$FUNCTION_NAME"; then
+            echo " $FUNCTION_NAME -> It exists, Not create aws resource."
+        else
+            echo "$FUNCTION_NAME -> It does not exist, so create a new lambda function"
+            echo "LAMBDA_FUNCTION_FLG=true" >> $GITHUB_ENV
+        fi
+
+    - name: Create Custom Policy
+      if: env.LAMBDA_FUNCTION_FLG == 'true'
+      run: |
+        POLICY=$(cat .github/json/policy.json | \
+          sed -e 's/<aws-region>/${{ secrets.AWS_REGION }}/g' \
+              -e 's/<aws-account-id>/${{ secrets.AWS_ACCOUNT_ID }}/g' \
+              -e 's/<sample-project>/${{ needs.check_commit_message.outputs.PROJECT_NAME }}/g')
+        aws iam create-policy \
+          --policy-name AWSLambdaBasicExecutionRole-${{ needs.check_commit_message.outputs.PROJECT_NAME }} \
+          --policy-document "$POLICY"
+    
+    - name: Create IAM role for Lambda
+      if: env.LAMBDA_FUNCTION_FLG == 'true'
+      run: |
+        TRUST_POLICY=$(cat .github/json/trust_policy.json)
+        aws iam create-role \
+          --role-name ${{ needs.check_commit_message.outputs.PROJECT_NAME }}-role \
+          --assume-role-policy-document "$TRUST_POLICY"
+
+    - name: Attach Custom Policy to Role
+      if: env.LAMBDA_FUNCTION_FLG == 'true'
+      run: |
+        aws iam attach-role-policy \
+          --role-name ${{ needs.check_commit_message.outputs.PROJECT_NAME }}-role \
+          --policy-arn arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:policy/AWSLambdaBasicExecutionRole-${{ needs.check_commit_message.outputs.PROJECT_NAME }}
+
+
+    - name: Get List and Create to AWS ECR Repository
+      run: |
+        REPO_NAME=${{ needs.check_commit_message.outputs.PROJECT_NAME }}
+        REPO_LIST=$(aws ecr describe-repositories 2>&1)
+        if echo "$REPO_LIST" | grep -q "$REPO_NAME"; then
+            echo " $REPO_NAME -> It exists, Not create"
+        else
+            echo "$REPO_NAME -> It does not exist, so create a new ecr repository"
+            aws ecr create-repository --repository-name ${{ needs.check_commit_message.outputs.PROJECT_NAME }}
+        fi
+
+    - name: Log in to AWS ECR
+      run: |
+        aws ecr get-login-password | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+    - name: Push Docker image to AWS ECR
+      run: |
+        docker tag ${{ needs.check_commit_message.outputs.PROJECT_NAME }}:latest ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ needs.check_commit_message.outputs.PROJECT_NAME }}:latest
+        docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ needs.check_commit_message.outputs.PROJECT_NAME }}:latest
+    
+
+    - name: Create to AWS Lambda Functon
+      if: env.LAMBDA_FUNCTION_FLG == 'true'
+      run: |
+        aws lambda create-function \
+          --function-name ${{ needs.check_commit_message.outputs.PROJECT_NAME }} \
+          --package-type Image \
+          --role arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ needs.check_commit_message.outputs.PROJECT_NAME }}-role \
+          --code ImageUri=${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ needs.check_commit_message.outputs.PROJECT_NAME }}:latest \
+          --timeout 240 \
+          --memory-size 512 \
+          --tags cost=ats \
+          --no-cli-pager
+    
+    - name: Update to AWS Lambda Functon
+      if: env.LAMBDA_FUNCTION_FLG == 'false'
+      run: |
+        aws lambda update-function-code \
+          --function-name ${{ needs.check_commit_message.outputs.PROJECT_NAME }} \
+          --image-uri ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ needs.check_commit_message.outputs.PROJECT_NAME }}:latest \
+          --no-cli-pager
